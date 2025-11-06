@@ -1,0 +1,116 @@
+# json_formatage.py
+import argparse
+import json
+import os
+import random
+from collections import defaultdict, Counter
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+IMG_EXTS = {"jpg", "jpeg", "png", "bmp", "webp"}
+
+def as_posix_relative(root: Path, p: Path) -> str:
+    """Chemin relatif en style Unix, stable sous Windows."""
+    return p.relative_to(root).as_posix()
+
+def scan_dataset(root: Path, exts: Iterable[str]) -> List[dict]:
+    exts = {e.lower().lstrip(".") for e in exts}
+    items: List[dict] = []
+    for cls_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
+        label = cls_dir.name
+        for p in cls_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower().lstrip(".") in exts:
+                items.append({"image": as_posix_relative(root, p), "label": label})
+    return items
+
+def make_label_maps(items: List[dict]) -> Tuple[List[str], Dict[str, int], Dict[int, str]]:
+    labels = sorted({x["label"] for x in items})
+    label2id = {l: i for i, l in enumerate(labels)}
+    id2label = {i: l for l, i in label2id.items()}
+    return labels, label2id, id2label
+
+def stratified_split(items: List[dict], ratios=(0.7, 0.15, 0.15), seed: int = 42) -> Tuple[List[dict], List[dict], List[dict]]:
+    """Split par classe pour conserver les proportions."""
+    assert abs(sum(ratios) - 1.0) < 1e-6, "Les ratios doivent sommer à 1."
+    rnd = random.Random(seed)
+    by_cls: Dict[str, List[dict]] = defaultdict(list)
+    for it in items:
+        by_cls[it["label"]].append(it)
+
+    train, val, test = [], [], []
+    for label, group in by_cls.items():
+        rnd.shuffle(group)
+        n = len(group)
+        n_train = int(ratios[0] * n)
+        n_val = int(ratios[1] * n)
+        train += group[:n_train]
+        val   += group[n_train:n_train + n_val]
+        test  += group[n_train + n_val:]
+    # Mélange global pour éviter l'ordre par classe
+    rnd.shuffle(train); rnd.shuffle(val); rnd.shuffle(test)
+    return train, val, test
+
+def save_json(obj, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def summarize(items: List[dict], title: str):
+    c = Counter([it["label"] for it in items])
+    total = len(items)
+    parts = [f"{lbl}: {c[lbl]}" for lbl in sorted(c)]
+    print(f"{title:<6} | {total:>5} images | " + "  ".join(parts))
+
+def main():
+    ap = argparse.ArgumentParser(prog="json_formatage",
+        description="Génère des manifests JSON (image ↔ label) depuis une arborescence de dossiers par classe.")
+    ap.add_argument("--root", default=".", help="Dossier racine contenant cardboard/, glass/, ... (défaut: .)")
+    ap.add_argument("--out", default="manifest", help="Dossier de sortie des JSON")
+    ap.add_argument("--exts", nargs="+", default=sorted(IMG_EXTS), help="Extensions d'images à inclure")
+    ap.add_argument("--split", nargs=3, type=float, default=[0.7, 0.15, 0.15], help="Ratios train/val/test")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--absolute", action="store_true",
+                    help="Stocker des chemins absolus (par défaut: chemins relatifs à --root).")
+    ap.add_argument("--dry-run", action="store_true", help="Ne rien écrire, juste afficher le résumé.")
+    args = ap.parse_args()
+
+    root = Path(args.root).resolve()
+    if not root.exists():
+        raise SystemExit(f"❌ Dossier introuvable: {root}")
+
+    items = scan_dataset(root, args.exts)
+    if not items:
+        raise SystemExit(f"❌ Aucune image trouvée sous {root} avec exts {args.exts}")
+
+    labels, label2id, id2label = make_label_maps(items)
+    items = [{"image": (str(root / it["image"]) if args.absolute else it["image"]),
+              "label": it["label"],
+              "label_id": label2id[it["label"]]} for it in items]
+
+    train, val, test = stratified_split(items, tuple(args.split), seed=args.seed)
+
+    # Résumés console
+    print(f"📂 Racine : {root}")
+    print(f"🏷️  Classes ({len(labels)}): {labels}")
+    summarize(items, "ALL")
+    summarize(train, "TRAIN")
+    summarize(val,   "VAL")
+    summarize(test,  "TEST")
+
+    if args.dry_run:
+        print("📝 Dry-run terminé (aucun fichier écrit).")
+        return
+
+    outdir = Path(args.out)
+    meta = {"root": (str(root) if args.absolute else "."), "num_images": len(items),
+            "labels": labels, "label2id": label2id, "split": args.split, "absolute_paths": args.absolute}
+    save_json(meta,  outdir / "meta.json")
+    save_json(items, outdir / "all.json")
+    save_json(train, outdir / "train.json")
+    save_json(val,   outdir / "val.json")
+    save_json(test,  outdir / "test.json")
+
+    print(f"✅ Manifests écrits dans : {outdir.resolve()}")
+
+if __name__ == "__main__":
+    main()
